@@ -1,19 +1,28 @@
 """
-benchmark.py - Automated Benchmark Suite untuk Distributed Prime Range Counter (Phase 5 - Final Polish).
+benchmark.py - Automated Benchmark Suite untuk Distributed Prime Range Counter.
 
-Melakukan pengujian komparatif performa:
-1. Mode Sequential (T_seq) vs Distributed (T_dist).
-2. Tiga skenario ukuran data:
-   - S1: N = 2,000,000  (Reference prime count: 148,933)
-   - S2: N = 6,000,000  (Reference prime count: 412,849)
-   - S3: N = 12,000,000 (Reference prime count: 788,060)
-3. 1 warm-up run per skenario (tidak dimasukkan ke statistik/CSV).
-4. Minimal 5 kali pengulangan (runs = 5).
-5. Perhitungan statistik lengkap: mean, median, standard deviation, min, max.
-6. Perhitungan Speedup (T_seq / T_dist) dan Efficiency ((Speedup / 2) * 100%).
-7. Validasi silang: Distributed vs Sequential (MATCH/MISMATCH) & Reference Ground Truth.
-8. Penyimpanan otomatis log eksekusi ke results.csv (mode append).
-9. Opsi --summary untuk menampilkan tabel ringkasan laporan langsung dari results.csv.
+Menghasilkan:
+- TABEL A: Hasil Pengujian Performa Setiap Skenario (N, T_seq, T_m, T_dist, Speedup, Eff (%))
+- TABEL B: Distribusi Beban Kerja Equal vs Weighted (N, Strategi, Beban PC 1, Beban PC 2, T_m, T_w, Rasio T_m : T_w)
+- TABEL C: Statistik Waktu Eksekusi Antar-Run (N, Mode, Run 1-5, Rata-rata, Median, Std. Dev)
+
+Fitur:
+1. Otomatisasi pengujian untuk 3 ukuran data:
+   - S1: N = 2.000.000  (Reference prime count: 148.933)
+   - S2: N = 6.000.000  (Reference prime count: 412.849)
+   - S3: N = 12.000.000 (Reference prime count: 788.060)
+2. 1 Warm-up run per skenario (tidak dimasukkan ke CSV atau statistik).
+3. 5 kali pengulangan (runs = 5) untuk masing-masing mode:
+   - Sequential baseline (T_seq)
+   - Distributed Weighted (T_dist, T_m, T_w, T_comm)
+   - Distributed Equal (T_dist, T_m, T_w, T_comm)
+4. Perhitungan statistik sesuai PRD:
+   - Rata-rata = sum(x) / 5
+   - Median = nilai tengah dari 5 run
+   - Standard Deviation = statistics.pstdev() untuk populasi 5 run
+5. Rasio beban kerja T_m : T_w ditulis dalam format "X,XX : 1,00".
+6. Penyimpanan otomatis log eksekusi ke results.csv (mode append).
+7. Flag --summary untuk menampilkan Tabel A, B, dan C langsung dari results.csv.
 """
 
 import argparse
@@ -24,7 +33,7 @@ import socket
 import statistics
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 from common import (
     KNOWN_PRIMES,
     count_primes,
@@ -62,7 +71,7 @@ CSV_FIELDNAMES = [
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Automated Benchmark Suite untuk Distributed Prime Range Counter (Phase 5)"
+        description="Automated Benchmark Suite untuk Distributed Prime Range Counter"
     )
     parser.add_argument(
         "--host",
@@ -85,9 +94,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         type=str,
-        choices=["weighted", "equal"],
-        default="weighted",
-        help="Strategi partisi data distributed: 'weighted' (default) atau 'equal'",
+        choices=["both", "weighted", "equal"],
+        default="both",
+        help="Strategi partisi yang diuji: 'both' (default, menguji weighted & equal), 'weighted', atau 'equal'",
     )
     parser.add_argument(
         "--sizes",
@@ -99,8 +108,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=300.0,
-        help="Timeout soket TCP dalam detik (default: 300.0)",
+        default=180.0,
+        help="Batas waktu soket dalam detik (default: 180.0)",
     )
     parser.add_argument(
         "--output",
@@ -111,45 +120,59 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--summary",
         action="store_true",
-        help="Tampilkan tabel ringkasan laporan dari file results.csv tanpa menjalankan benchmark",
+        help="Tampilkan Tabel A, B, dan C dari file results.csv tanpa menjalankan benchmark ulang",
     )
     return parser.parse_args()
 
 
 # =====================================================================
-# 1. STATISTICAL HELPER
+# 1. STATISTICAL & FORMATTING HELPERS
 # =====================================================================
 
 
 def calculate_stats(data: list[float]) -> dict[str, float]:
     """
-    Menghitung mean, median, stdev, min, dan max dari kumpulan data float.
-    Menghindari error StatisticsError jika jumlah data < 2.
+    Menghitung mean, median, pstdev (population standard deviation), min, max.
+    Sesuai instruksi PRD: Standard deviation menggunakan statistics.pstdev()
+    untuk 5 run yang dilaporkan.
     """
     if not data:
-        return {"mean": 0.0, "median": 0.0, "stdev": 0.0, "min": 0.0, "max": 0.0}
+        return {"mean": 0.0, "median": 0.0, "pstdev": 0.0, "min": 0.0, "max": 0.0}
     mean_val = statistics.mean(data)
     median_val = statistics.median(data)
-    stdev_val = statistics.stdev(data) if len(data) >= 2 else 0.0
+    pstdev_val = statistics.pstdev(data) if len(data) >= 1 else 0.0
     return {
         "mean": mean_val,
         "median": median_val,
-        "stdev": stdev_val,
+        "pstdev": pstdev_val,
         "min": min(data),
         "max": max(data),
     }
 
 
+def format_id_num(val: int) -> str:
+    """Format angka integer dengan pemisah titik gaya Indonesia (e.g. 2.000.000)."""
+    return f"{val:,}".replace(",", ".")
+
+
+def format_ratio_tm_tw(t_m: float, t_w: float) -> str:
+    """
+    Format rasio waktu T_m : T_w dalam bentuk 'X,XX : 1,00'.
+    Contoh: 1,12 : 1,00 atau 0,98 : 1,00.
+    """
+    if t_w <= 0.0:
+        return "N/A"
+    ratio = t_m / t_w
+    return f"{ratio:.2f}".replace(".", ",") + " : 1,00"
+
+
 # =====================================================================
-# 2. CSV LOGGING & REPORT SUMMARY
+# 2. CSV LOGGING
 # =====================================================================
 
 
 def append_csv_row(csv_path: str, row_dict: dict[str, Any]) -> None:
-    """
-    Menuliskan baris data ke results.csv secara aman (append).
-    Otomatis membuat header jika file belum ada.
-    """
+    """Menuliskan baris data ke results.csv secara aman (append)."""
     file_exists = os.path.isfile(csv_path)
     with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
@@ -158,82 +181,13 @@ def append_csv_row(csv_path: str, row_dict: dict[str, Any]) -> None:
         writer.writerow(row_dict)
 
 
-def print_report_summary(csv_path: str) -> None:
-    """
-    Membaca results.csv dan menyajikan tabel ringkasan formal untuk laporan tugas.
-    """
-    if not os.path.isfile(csv_path):
-        print(f"[INFO] File '{csv_path}' belum ditemukan. Jalankan benchmark terlebih dahulu.")
-        return
-
-    scenarios_data: dict[int, dict[str, list[float]]] = {}
-    validation_status: dict[int, str] = {}
-
-    with open(csv_path, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("mode") != "dist":
-                continue
-            try:
-                n = int(row["n"])
-                t_seq = float(row["t_seq"])
-                t_dist = float(row["t_dist"])
-                speedup = float(row["speedup"])
-                eff = float(row["efficiency"])
-                val = row["validation"]
-            except (ValueError, KeyError):
-                continue
-
-            if n not in scenarios_data:
-                scenarios_data[n] = {
-                    "t_seq": [],
-                    "t_dist": [],
-                    "speedup": [],
-                    "eff": [],
-                }
-                validation_status[n] = "MATCH"
-
-            scenarios_data[n]["t_seq"].append(t_seq)
-            scenarios_data[n]["t_dist"].append(t_dist)
-            scenarios_data[n]["speedup"].append(speedup)
-            scenarios_data[n]["eff"].append(eff)
-            if val != "MATCH":
-                validation_status[n] = "MISMATCH"
-
-    if not scenarios_data:
-        print(f"[INFO] Belum ada data distributed run di '{csv_path}'.")
-        return
-
-    print("========================================================================================")
-    print("DISTRIBUTED PRIME RANGE COUNTER — BENCHMARK REPORT TABLE")
-    print("========================================================================================")
-    print(f"{'N':>12} | {'Mean T_seq':>12} | {'Mean T_dist':>12} | {'Speedup':>9} | {'Efficiency':>10} | {'Validation':<10}")
-    print("-" * 88)
-
-    for n in sorted(scenarios_data.keys()):
-        data = scenarios_data[n]
-        mean_seq = statistics.mean(data["t_seq"]) if data["t_seq"] else 0.0
-        mean_dist = statistics.mean(data["t_dist"]) if data["t_dist"] else 0.0
-        mean_sp = statistics.mean(data["speedup"]) if data["speedup"] else 0.0
-        mean_ef = statistics.mean(data["eff"]) if data["eff"] else 0.0
-        val = validation_status.get(n, "MATCH")
-
-        print(
-            f"{n:>12,} | {mean_seq:>10.6f} s | {mean_dist:>10.6f} s | {mean_sp:>7.2f}x | {mean_ef:>8.2f} % | {val:<10}"
-        )
-
-    print("========================================================================================")
-
-
 # =====================================================================
 # 3. BENCHMARK EXECUTION HELPERS
 # =====================================================================
 
 
 def execute_sequential_run(n: int) -> tuple[int, float]:
-    """
-    Mengeksekusi perhitungan sequential [1, N] dan mengukur T_seq murni.
-    """
+    """Mengeksekusi perhitungan sequential [1, N] dan mengukur T_seq murni."""
     t0 = time.perf_counter()
     count = count_primes(1, n)
     t1 = time.perf_counter()
@@ -269,7 +223,7 @@ def execute_distributed_run(
     tm1 = time.perf_counter()
     t_m = tm1 - tm0
 
-    # Terima respons dari Worker fisik
+    # Terima respons dari Worker fisik (T_w)
     worker_resp = recv_msg(sock)
     if worker_resp is None:
         raise ConnectionResetError("Worker menutup koneksi sebelum mengirimkan RESULT.")
@@ -304,7 +258,229 @@ def execute_distributed_run(
 
 
 # =====================================================================
-# 4. MAIN BENCHMARK ORCHESTRATION
+# 4. TABEL RENDERING (TABEL A, TABEL B, TABEL C)
+# =====================================================================
+
+
+def print_table_a(scenario_data: list[dict[str, Any]]) -> None:
+    """
+    TABEL A: HASIL PENGUJIAN PERFORMA SETIAP SKENARIO
+    Kolom: Skenario (N) | T_seq (s) | T_m (s) | T_dist (s) | Speedup | Eff (%)
+    """
+    print("\n### TABEL A: HASIL PENGUJIAN PERFORMA SETIAP SKENARIO\n")
+    print("| Skenario (N) | T_seq (s) | T_m (s) | T_dist (s) | Speedup | Eff (%) |")
+    print("|-------------:|----------:|--------:|-----------:|--------:|--------:|")
+
+    for item in scenario_data:
+        n_str = format_id_num(item["n"])
+        t_seq = f"{item['t_seq_mean']:.6f}"
+        t_m = f"{item['t_m_mean']:.6f}"
+        t_dist = f"{item['t_dist_mean']:.6f}"
+        speedup = f"{item['speedup_mean']:.2f}x"
+        eff = f"{item['eff_mean']:.2f}%"
+        print(f"| {n_str:>12} | {t_seq:>9} | {t_m:>7} | {t_dist:>10} | {speedup:>7} | {eff:>7} |")
+    print()
+
+
+def print_table_b(distribution_data: list[dict[str, Any]]) -> None:
+    """
+    TABEL B: DISTRIBUSI BEBAN KERJA (EQUAL VS WEIGHTED)
+    Kolom: N | Strategi | Beban PC 1 | Beban PC 2 | T_m (s) | T_w (s) | Rasio T_m : T_w
+    """
+    print("\n### TABEL B: DISTRIBUSI BEBAN KERJA (EQUAL VS WEIGHTED)\n")
+    print("|          N | Strategi | Beban PC 1 | Beban PC 2 |   T_m (s) |   T_w (s) | Rasio T_m : T_w |")
+    print("|-----------:|:---------|-----------:|-----------:|----------:|----------:|:----------------|")
+
+    for row in distribution_data:
+        n_str = format_id_num(row["n"])
+        strat = row["strategy"]
+        load1 = format_id_num(row["load_pc1"])
+        load2 = format_id_num(row["load_pc2"])
+        t_m = f"{row['t_m_mean']:.6f}"
+        t_w = f"{row['t_w_mean']:.6f}"
+        ratio = row["ratio_str"]
+        print(f"| {n_str:>10} | {strat:<8} | {load1:>10} | {load2:>10} | {t_m:>9} | {t_w:>9} | {ratio:<15} |")
+    print()
+
+
+def print_table_c(runs_data: list[dict[str, Any]]) -> None:
+    """
+    TABEL C: STATISTIK WAKTU EKSEKUSI ANTAR-RUN
+    Kolom: N | Mode | Run 1 (s) | Run 2 (s) | Run 3 (s) | Run 4 (s) | Run 5 (s) | Rata-rata (s) | Median (s) | Std. Dev (s)
+    """
+    print("\n### TABEL C: STATISTIK WAKTU EKSEKUSI ANTAR-RUN\n")
+    print("|          N | Mode          | Run 1 (s) | Run 2 (s) | Run 3 (s) | Run 4 (s) | Run 5 (s) | Rata-rata (s) | Median (s) | Std. Dev (s) |")
+    print("|-----------:|:--------------|----------:|----------:|----------:|----------:|----------:|--------------:|-----------:|-------------:|")
+
+    for row in runs_data:
+        n_str = format_id_num(row["n"])
+        mode_str = row["mode"]
+        runs = row["runs"]
+        r_strs = [f"{r:.6f}" for r in runs[:5]]
+        while len(r_strs) < 5:
+            r_strs.append("-")
+
+        mean_str = f"{row['mean']:.6f}"
+        med_str = f"{row['median']:.6f}"
+        std_str = f"{row['pstdev']:.6f}"
+
+        print(
+            f"| {n_str:>10} | {mode_str:<13} | "
+            f"{r_strs[0]:>9} | {r_strs[1]:>9} | {r_strs[2]:>9} | {r_strs[3]:>9} | {r_strs[4]:>9} | "
+            f"{mean_str:>13} | {med_str:>10} | {std_str:>12} |"
+        )
+    print()
+
+
+# =====================================================================
+# 5. SUMMARY DARI CSV FILE (--summary)
+# =====================================================================
+
+
+def print_report_summary_from_csv(csv_path: str) -> None:
+    """
+    Membaca data dari results.csv dan menyusun Tabel A, B, dan C secara otomatis.
+    """
+    if not os.path.isfile(csv_path):
+        print(f"[ERROR] File '{csv_path}' belum ditemukan.")
+        print("Silakan jalankan pengujian benchmark terlebih dahulu.")
+        return
+
+    records: list[dict[str, str]] = []
+    with open(csv_path, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            records.append(r)
+
+    if not records:
+        print(f"[INFO] File '{csv_path}' kosong.")
+        return
+
+    unique_ns = sorted(list({int(r["n"]) for r in records if r.get("n")}))
+
+    scenario_a: list[dict[str, Any]] = []
+    table_b: list[dict[str, Any]] = []
+    table_c: list[dict[str, Any]] = []
+
+    for n_val in unique_ns:
+        n_rows = [r for r in records if int(r.get("n", 0)) == n_val]
+
+        seq_rows = [r for r in n_rows if r.get("mode") == "seq"][-5:]
+        dist_w_rows = [r for r in n_rows if r.get("mode") == "dist" and r.get("split") == "weighted"][-5:]
+        dist_e_rows = [r for r in n_rows if r.get("mode") == "dist" and r.get("split") == "equal"][-5:]
+
+        seq_times = [float(r["t_seq"]) for r in seq_rows if r.get("t_seq")]
+        dw_dist_times = [float(r["t_dist"]) for r in dist_w_rows if r.get("t_dist")]
+        dw_tm_times = [float(r["t_master"]) for r in dist_w_rows if r.get("t_master")]
+        dw_tw_times = [float(r["t_worker"]) for r in dist_w_rows if r.get("t_worker")]
+        dw_speedups = [float(r["speedup"]) for r in dist_w_rows if r.get("speedup")]
+        dw_effs = [float(r["efficiency"]) for r in dist_w_rows if r.get("efficiency")]
+
+        de_dist_times = [float(r["t_dist"]) for r in dist_e_rows if r.get("t_dist")]
+        de_tm_times = [float(r["t_master"]) for r in dist_e_rows if r.get("t_master")]
+        de_tw_times = [float(r["t_worker"]) for r in dist_e_rows if r.get("t_worker")]
+
+        # 1. Tabel A (menggunakan weighted sebagai konfigurasi optimal distributed)
+        if seq_times and dw_dist_times:
+            mean_seq = statistics.mean(seq_times)
+            mean_dist = statistics.mean(dw_dist_times)
+            mean_tm = statistics.mean(dw_tm_times) if dw_tm_times else 0.0
+            mean_sp = statistics.mean(dw_speedups) if dw_speedups else (mean_seq / mean_dist if mean_dist > 0 else 0.0)
+            mean_ef = statistics.mean(dw_effs) if dw_effs else ((mean_sp / 2.0) * 100.0)
+
+            scenario_a.append({
+                "n": n_val,
+                "t_seq_mean": mean_seq,
+                "t_m_mean": mean_tm,
+                "t_dist_mean": mean_dist,
+                "speedup_mean": mean_sp,
+                "eff_mean": mean_ef,
+            })
+
+        # 2. Tabel B (Equal & Weighted)
+        m_s_eq, m_e_eq, w_s_eq, w_e_eq = split_range(n_val, "equal")
+        load_pc1_eq = m_e_eq - m_s_eq + 1
+        load_pc2_eq = w_e_eq - w_s_eq + 1
+
+        m_s_wt, m_e_wt, w_s_wt, w_e_wt = split_range(n_val, "weighted")
+        load_pc1_wt = m_e_wt - m_s_wt + 1
+        load_pc2_wt = w_e_wt - w_s_wt + 1
+
+        if de_tm_times and de_tw_times:
+            tm_eq = statistics.mean(de_tm_times)
+            tw_eq = statistics.mean(de_tw_times)
+            table_b.append({
+                "n": n_val,
+                "strategy": "Equal",
+                "load_pc1": load_pc1_eq,
+                "load_pc2": load_pc2_eq,
+                "t_m_mean": tm_eq,
+                "t_w_mean": tw_eq,
+                "ratio_str": format_ratio_tm_tw(tm_eq, tw_eq),
+            })
+
+        if dw_tm_times and dw_tw_times:
+            tm_wt = statistics.mean(dw_tm_times)
+            tw_wt = statistics.mean(dw_tw_times)
+            table_b.append({
+                "n": n_val,
+                "strategy": "Weighted",
+                "load_pc1": load_pc1_wt,
+                "load_pc2": load_pc2_wt,
+                "t_m_mean": tm_wt,
+                "t_w_mean": tw_wt,
+                "ratio_str": format_ratio_tm_tw(tm_wt, tw_wt),
+            })
+
+        # 3. Tabel C (Runs statistics)
+        if seq_times:
+            st = calculate_stats(seq_times)
+            table_c.append({
+                "n": n_val,
+                "mode": "seq",
+                "runs": seq_times,
+                "mean": st["mean"],
+                "median": st["median"],
+                "pstdev": st["pstdev"],
+            })
+
+        if dw_dist_times:
+            st = calculate_stats(dw_dist_times)
+            table_c.append({
+                "n": n_val,
+                "mode": "dist-weighted",
+                "runs": dw_dist_times,
+                "mean": st["mean"],
+                "median": st["median"],
+                "pstdev": st["pstdev"],
+            })
+
+        if de_dist_times:
+            st = calculate_stats(de_dist_times)
+            table_c.append({
+                "n": n_val,
+                "mode": "dist-equal",
+                "runs": de_dist_times,
+                "mean": st["mean"],
+                "median": st["median"],
+                "pstdev": st["pstdev"],
+            })
+
+    print("==========================================================================================")
+    print("DISTRIBUTED PRIME RANGE COUNTER — BENCHMARK REPORT SUMMARY")
+    print(f"Data source: {csv_path}")
+    print("==========================================================================================")
+
+    if scenario_a:
+        print_table_a(scenario_a)
+    if table_b:
+        print_table_b(table_b)
+    if table_c:
+        print_table_c(table_c)
+
+
+# =====================================================================
+# 6. MAIN BENCHMARK EXECUTION
 # =====================================================================
 
 
@@ -312,7 +488,7 @@ def run_benchmark(
     host: str,
     port: int,
     runs: int,
-    split_mode: str,
+    split_option: str,
     sizes: list[int],
     timeout: float,
     output_csv: str,
@@ -321,23 +497,25 @@ def run_benchmark(
         print("ERROR: Jumlah runs harus >= 1.")
         sys.exit(1)
 
-    print("============================================================")
-    print("DISTRIBUTED PRIME RANGE COUNTER — BENCHMARK SUITE")
-    print("============================================================")
-    print(f"Target Worker       : {host}:{port}")
-    print(f"Split Strategy      : {split_mode}")
-    print(f"Runs per Scenario   : {runs}x")
-    print(f"Scenarios (N)       : {', '.join(f'{sz:,}' for sz in sizes)}")
-    print(f"Output CSV          : {output_csv}")
-    print("============================================================\n")
+    splits_to_test = ["weighted", "equal"] if split_option == "both" else [split_option]
+
+    print("==========================================================================================")
+    print("DISTRIBUTED PRIME RANGE COUNTER — AUTOMATED BENCHMARK SUITE")
+    print("==========================================================================================")
+    print(f"Target Worker Node  : {host}:{port}")
+    print(f"Split Strategies    : {', '.join(splits_to_test)}")
+    print(f"Runs per Mode       : {runs}x (+ 1 warm-up)")
+    print(f"Data Sizes (N)      : {', '.join(format_id_num(sz) for sz in sizes)}")
+    print(f"Output File         : {output_csv}")
+    print("==========================================================================================\n")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
 
     try:
-        print(f"[CONNECT] Menghubungkan ke Worker di {host}:{port}...")
+        print(f"[CONNECT] Menghubungkan ke Worker node di {host}:{port}...")
         sock.connect((host, port))
-        print("[CONNECTED] Koneksi ke Worker berhasil diverifikasi.\n")
+        print("[CONNECTED] Koneksi TCP ke Worker berhasil diverifikasi.\n")
     except ConnectionRefusedError:
         print("ERROR: Cannot connect to Worker.")
         print(f"Make sure PC2 is running worker.py on port {port}.")
@@ -350,28 +528,35 @@ def run_benchmark(
         print(f"ERROR: Cannot connect to port {port}. Check Worker configuration and firewall ({e}).")
         sys.exit(1)
 
-    scenario_summaries: list[dict[str, Any]] = []
+    scenario_a_list: list[dict[str, Any]] = []
+    table_b_list: list[dict[str, Any]] = []
+    table_c_list: list[dict[str, Any]] = []
 
     try:
         for idx, n in enumerate(sizes, start=1):
             sc_name = f"S{idx}"
-            print("------------------------------------------------------------")
-            print(f"SCENARIO {sc_name}: N = {n:,}")
-            print("------------------------------------------------------------")
+            print("==========================================================================================")
+            print(f"SKENARIO {sc_name}: N = {format_id_num(n)}")
+            print("==========================================================================================")
 
+            # -------------------------------------------------------------
             # A. WARM-UP RUN (1x per skenario, tidak dihitung ke hasil/CSV)
-            print("[WARM-UP] Menjalankan 1 warm-up run (tidak masuk statistik)...")
+            # -------------------------------------------------------------
+            print("[WARM-UP] Menjalankan warm-up (tidak dicatat ke statistik/CSV)...")
             execute_sequential_run(n)
-            execute_distributed_run(
-                sock, n, split_mode, f"warmup-{sc_name}-{int(time.time())}"
-            )
+            for sm in splits_to_test:
+                execute_distributed_run(
+                    sock, n, sm, f"warmup-{sc_name}-{sm}-{int(time.time())}"
+                )
             print("[WARM-UP] Selesai.\n")
 
-            # B. STEP A: SEQUENTIAL RUNS
+            # -------------------------------------------------------------
+            # B. SEQUENTIAL RUNS (5x)
+            # -------------------------------------------------------------
             seq_times: list[float] = []
             seq_counts: list[int] = []
 
-            print(f"[BENCHMARK] Menjalankan {runs}x pengujian Sequential...")
+            print(f"[1/3] Menjalankan {runs}x pengujian SEQUENTIAL...")
             for r in range(1, runs + 1):
                 count, t_seq = execute_sequential_run(n)
                 seq_times.append(t_seq)
@@ -407,98 +592,142 @@ def run_benchmark(
                     },
                 )
 
-            # C. STEP B: DISTRIBUTED RUNS
-            dist_times: list[float] = []
-            tm_times: list[float] = []
-            tw_times: list[float] = []
-            tcomm_times: list[float] = []
-            speedups: list[float] = []
-            efficiencies: list[float] = []
-            dist_counts: list[int] = []
-            scenario_matches = True
-
-            print(f"\n[BENCHMARK] Menjalankan {runs}x pengujian Distributed ({split_mode})...")
-            for r in range(1, runs + 1):
-                task_id = f"bench-{sc_name}-run{r}-{int(time.time())}"
-                d_res = execute_distributed_run(sock, n, split_mode, task_id)
-
-                t_seq_paired = seq_times[r - 1]
-                t_dist = d_res["t_dist"]
-                speedup = (t_seq_paired / t_dist) if t_dist > 0 else 0.0
-                efficiency = (speedup / 2.0) * 100.0
-
-                is_match = d_res["total_primes"] == seq_counts[r - 1]
-                if not is_match:
-                    scenario_matches = False
-                val_status = "MATCH" if is_match else "MISMATCH"
-
-                dist_times.append(t_dist)
-                tm_times.append(d_res["t_m"])
-                tw_times.append(d_res["t_w"])
-                tcomm_times.append(d_res["t_comm"])
-                speedups.append(speedup)
-                efficiencies.append(efficiency)
-                dist_counts.append(d_res["total_primes"])
-
-                print(
-                    f"  Run {r}/{runs} (Dist): {d_res['total_primes']:,} prima "
-                    f"| T_dist = {t_dist:.6f} s | Speedup = {speedup:.2f}x | Eff = {efficiency:.2f}% "
-                    f"| Validasi = {val_status}"
-                )
-
-                append_csv_row(
-                    output_csv,
-                    {
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "scenario": sc_name,
-                        "run": r,
-                        "n": n,
-                        "mode": "dist",
-                        "split": split_mode,
-                        "master_start": d_res["master_start"],
-                        "master_end": d_res["master_end"],
-                        "worker_start": d_res["worker_start"],
-                        "worker_end": d_res["worker_end"],
-                        "master_range_size": d_res["master_range_size"],
-                        "worker_range_size": d_res["worker_range_size"],
-                        "master_prime_count": d_res["c1"],
-                        "worker_prime_count": d_res["c2"],
-                        "final_prime_count": d_res["total_primes"],
-                        "t_seq": f"{t_seq_paired:.6f}",
-                        "t_master": f"{d_res['t_m']:.6f}",
-                        "t_worker": f"{d_res['t_w']:.6f}",
-                        "t_dist": f"{t_dist:.6f}",
-                        "t_comm": f"{d_res['t_comm']:.6f}",
-                        "speedup": f"{speedup:.4f}",
-                        "efficiency": f"{efficiency:.2f}",
-                        "validation": val_status,
-                    },
-                )
-
-            summary = {
-                "name": sc_name,
+            seq_st = calculate_stats(seq_times)
+            table_c_list.append({
                 "n": n,
-                "seq_stats": calculate_stats(seq_times),
-                "dist_stats": calculate_stats(dist_times),
-                "tm_stats": calculate_stats(tm_times),
-                "tw_stats": calculate_stats(tw_times),
-                "tcomm_stats": calculate_stats(tcomm_times),
-                "speedup_stats": calculate_stats(speedups),
-                "eff_stats": calculate_stats(efficiencies),
-                "seq_count": seq_counts[-1],
-                "dist_count": dist_counts[-1],
-                "match": scenario_matches,
-                "expected": KNOWN_PRIMES.get(n),
-            }
-            scenario_summaries.append(summary)
+                "mode": "seq",
+                "runs": seq_times,
+                "mean": seq_st["mean"],
+                "median": seq_st["median"],
+                "pstdev": seq_st["pstdev"],
+            })
+
+            # -------------------------------------------------------------
+            # C. DISTRIBUTED RUNS (WEIGHTED & EQUAL)
+            # -------------------------------------------------------------
+            dist_results_by_split: dict[str, dict[str, Any]] = {}
+
+            step_counter = 2
+            for s_mode in splits_to_test:
+                print(f"\n[{step_counter}/3] Menjalankan {runs}x pengujian DISTRIBUTED ({s_mode.upper()})...")
+                step_counter += 1
+
+                d_times: list[float] = []
+                tm_times: list[float] = []
+                tw_times: list[float] = []
+                tcomm_times: list[float] = []
+                speedups: list[float] = []
+                efficiencies: list[float] = []
+                dist_counts: list[int] = []
+
+                for r in range(1, runs + 1):
+                    task_id = f"bench-{sc_name}-{s_mode}-run{r}-{int(time.time())}"
+                    d_res = execute_distributed_run(sock, n, s_mode, task_id)
+
+                    t_seq_paired = seq_times[r - 1]
+                    t_dist = d_res["t_dist"]
+                    speedup = (t_seq_paired / t_dist) if t_dist > 0 else 0.0
+                    efficiency = (speedup / 2.0) * 100.0
+
+                    is_match = d_res["total_primes"] == seq_counts[r - 1]
+                    val_status = "MATCH" if is_match else "MISMATCH"
+
+                    d_times.append(t_dist)
+                    tm_times.append(d_res["t_m"])
+                    tw_times.append(d_res["t_w"])
+                    tcomm_times.append(d_res["t_comm"])
+                    speedups.append(speedup)
+                    efficiencies.append(efficiency)
+                    dist_counts.append(d_res["total_primes"])
+
+                    print(
+                        f"  Run {r}/{runs} ({s_mode}) : {d_res['total_primes']:,} prima "
+                        f"| T_dist = {t_dist:.6f} s | T_m = {d_res['t_m']:.6f} s | T_w = {d_res['t_w']:.6f} s "
+                        f"| Speedup = {speedup:.2f}x | Eff = {efficiency:.2f}% | Val = {val_status}"
+                    )
+
+                    append_csv_row(
+                        output_csv,
+                        {
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "scenario": sc_name,
+                            "run": r,
+                            "n": n,
+                            "mode": "dist",
+                            "split": s_mode,
+                            "master_start": d_res["master_start"],
+                            "master_end": d_res["master_end"],
+                            "worker_start": d_res["worker_start"],
+                            "worker_end": d_res["worker_end"],
+                            "master_range_size": d_res["master_range_size"],
+                            "worker_range_size": d_res["worker_range_size"],
+                            "master_prime_count": d_res["c1"],
+                            "worker_prime_count": d_res["c2"],
+                            "final_prime_count": d_res["total_primes"],
+                            "t_seq": f"{t_seq_paired:.6f}",
+                            "t_master": f"{d_res['t_m']:.6f}",
+                            "t_worker": f"{d_res['t_w']:.6f}",
+                            "t_dist": f"{t_dist:.6f}",
+                            "t_comm": f"{d_res['t_comm']:.6f}",
+                            "speedup": f"{speedup:.4f}",
+                            "efficiency": f"{efficiency:.2f}",
+                            "validation": val_status,
+                        },
+                    )
+
+                dist_results_by_split[s_mode] = {
+                    "d_times": d_times,
+                    "tm_times": tm_times,
+                    "tw_times": tw_times,
+                    "speedups": speedups,
+                    "efficiencies": efficiencies,
+                    "last_res": d_res,
+                }
+
+                # Catat ke Tabel C
+                dst = calculate_stats(d_times)
+                table_c_list.append({
+                    "n": n,
+                    "mode": f"dist-{s_mode}",
+                    "runs": d_times,
+                    "mean": dst["mean"],
+                    "median": dst["median"],
+                    "pstdev": dst["pstdev"],
+                })
+
+                # Catat ke Tabel B
+                strat_label = "Weighted" if s_mode == "weighted" else "Equal"
+                tm_m = statistics.mean(tm_times)
+                tw_m = statistics.mean(tw_times)
+                table_b_list.append({
+                    "n": n,
+                    "strategy": strat_label,
+                    "load_pc1": d_res["master_range_size"],
+                    "load_pc2": d_res["worker_range_size"],
+                    "t_m_mean": tm_m,
+                    "t_w_mean": tw_m,
+                    "ratio_str": format_ratio_tm_tw(tm_m, tw_m),
+                })
+
+            primary_dist = "weighted" if "weighted" in dist_results_by_split else splits_to_test[0]
+            p_res = dist_results_by_split[primary_dist]
+            scenario_a_list.append({
+                "n": n,
+                "t_seq_mean": seq_st["mean"],
+                "t_m_mean": statistics.mean(p_res["tm_times"]),
+                "t_dist_mean": statistics.mean(p_res["d_times"]),
+                "speedup_mean": statistics.mean(p_res["speedups"]),
+                "eff_mean": statistics.mean(p_res["efficiencies"]),
+            })
+
             print()
 
         # D. GRACEFUL SHUTDOWN WORKER
-        print("[CLEANUP] Mengirimkan sinyal STOP ke Worker...")
+        print("[CLEANUP] Mengirimkan sinyal STOP ke Worker di PC 2...")
         send_msg(sock, {"type": "STOP"})
         ack = recv_msg(sock)
         if ack and (ack.get("type") == "ACK" or ack.get("action") == "ACK"):
-            print("[CLEANUP] Worker shutdown graceful terkonfirmasi.")
+            print("[CLEANUP] Worker shutdown terkonfirmasi secara graceful.")
 
     except ConnectionResetError:
         print("[ERROR] Koneksi diputus tiba-tiba oleh Worker saat benchmark berlangsung.")
@@ -515,61 +744,29 @@ def run_benchmark(
         print("[CLEANUP] Koneksi soket ditutup.\n")
 
     # =====================================================================
-    # 5. CETAK LAPORAN SUMMARY BENCHMARK RESMI
+    # 7. CETAK TABEL HASIL BENCHMARK
     # =====================================================================
-    print("============================================================")
-    print("DISTRIBUTED PRIME RANGE COUNTER — BENCHMARK SUMMARY")
-    print("============================================================")
-    print(f"Split : {split_mode}")
-    print(f"Runs  : {runs}")
+    print("==========================================================================================")
+    print("HASIL LENGKAP BENCHMARK DISTRIBUTED PRIME RANGE COUNTER")
+    print("==========================================================================================")
 
-    for s in scenario_summaries:
-        n_val = s["n"]
-        print("\n------------------------------------------------------------")
-        print(f"N = {n_val:,} ({s['name']})")
-        print("------------------------------------------------------------")
+    if scenario_a_list:
+        print_table_a(scenario_a_list)
+    if table_b_list:
+        print_table_b(table_b_list)
+    if table_c_list:
+        print_table_c(table_c_list)
 
-        print("Sequential (T_seq)")
-        print(f"Mean   : {s['seq_stats']['mean']:.6f} s")
-        print(f"Median : {s['seq_stats']['median']:.6f} s")
-        print(f"Std    : {s['seq_stats']['stdev']:.6f} s")
-
-        print("\nDistributed (T_dist)")
-        print(f"Mean   : {s['dist_stats']['mean']:.6f} s")
-        print(f"Median : {s['dist_stats']['median']:.6f} s")
-        print(f"Std    : {s['dist_stats']['stdev']:.6f} s")
-
-        print("\nSpeedup")
-        print(f"Mean   : {s['speedup_stats']['mean']:.2f} x")
-        print(f"Median : {s['speedup_stats']['median']:.2f} x")
-        print(f"Std    : {s['speedup_stats']['stdev']:.4f}")
-
-        print("\nEfficiency")
-        print(f"Mean   : {s['eff_stats']['mean']:.2f} %")
-        print(f"Median : {s['eff_stats']['median']:.2f} %")
-        print(f"Std    : {s['eff_stats']['stdev']:.2f} %")
-
-        print("\nValidation")
-        val_text = "MATCH" if s["match"] else "MISMATCH (ERROR)"
-        print(f"Sequential vs Distributed : {val_text}")
-
-        if s["expected"] is not None:
-            exp_match = s["dist_count"] == s["expected"]
-            ref_text = "MATCH" if exp_match else "REFERENCE MISMATCH (WARNING)"
-            print(
-                f"Reference Ground Truth    : {ref_text} "
-                f"(Expected: {s['expected']:,} | Actual: {s['dist_count']:,})"
-            )
-
-    print("\n============================================================")
-    print(f"RESULTS SAVED TO {output_csv}")
-    print("============================================================")
+    print("==========================================================================================")
+    print(f"Seluruh log hasil tersimpan permanen di: {output_csv}")
+    print("Gunakan 'python benchmark.py --summary' untuk melihat kembali tabel ringkasan kapan saja.")
+    print("==========================================================================================")
 
 
 def main() -> None:
     args = parse_arguments()
     if args.summary:
-        print_report_summary(args.output)
+        print_report_summary_from_csv(args.output)
         return
 
     if not args.host:
@@ -583,7 +780,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         runs=args.runs,
-        split_mode=args.split,
+        split_option=args.split,
         sizes=args.sizes,
         timeout=args.timeout,
         output_csv=args.output,
