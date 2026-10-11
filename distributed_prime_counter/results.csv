@@ -1,0 +1,2 @@
+timestamp,scenario,run,n,mode,split,master_start,master_end,worker_start,worker_end,master_range_size,worker_range_size,master_prime_count,worker_prime_count,final_prime_count,t_seq,t_master,t_worker,t_dist,t_comm,speedup,efficiency,validation
+
